@@ -168,7 +168,7 @@ export class ParserService {
 
         for (let grade = 1; grade <= 3; grade++) {
             result.student[grade] = {};
-            for (let classroomNo = 1; classroomNo <= 10; classroomNo++) {
+            for (let classroomNo = 1; classroomNo <= 9; classroomNo++) { // 학급 수 변동으로 인한 코드 수정_fixed by Paulee(이민상)
                 if (result.student[grade][classroomNo] == null)
                     result.student[grade][classroomNo] = [];
                 result.student[grade][classroomNo] =
