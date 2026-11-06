@@ -1,4 +1,5 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { fetchComciData } from './comci-client';
 import {
     ClassPeriod,
     ClassroomNoT,
@@ -21,6 +22,7 @@ export class ParserService {
     #timetable: TimeTableModel;
     #weekdayString: string[] = ['일', '월', '화', '수', '목', '금', '토'];
     #renewTime: Date | null = null;
+    #renewing: Promise<void> | null = null;
 
     async init() {
         if (this.#init) throw new Error('ParserService is already initialized');
@@ -28,12 +30,13 @@ export class ParserService {
             await this.renewData(true);
             this.#init = true;
         } catch (e) {
-            console.error(e);
+            console.error('Unable to initialize timetable data');
             throw new Error('Failed to initialize ParserService');
         }
     }
 
     async renewData(force = false) {
+        if (this.#renewing) return this.#renewing;
         const now = new Date();
         if (
             this.#renewTime != null &&
@@ -42,27 +45,33 @@ export class ParserService {
             !force
         )
             return;
-        await this._getData().then((data) => {
-            this.#timetable = data;
-            this.#renewTime = new Date();
-            console.log(new Date(), 'Data renewed');
-        });
+        this.#renewing = this._getData()
+            .then((data) => {
+                this.#timetable = data;
+                this.#renewTime = new Date();
+                console.log(new Date(), 'Data renewed');
+            })
+            .finally(() => {
+                this.#renewing = null;
+            });
+        return this.#renewing;
     }
 
     async getTimetable() {
-        if (!this.#init) throw new Error('ParserService is not initialized');
+        if (!this.#init) throw new ServiceUnavailableException('Timetable data is not ready');
         await this.renewData();
         return this.#timetable;
     }
 
     async getTeachers() {
-        if (!this.#init) throw new Error('ParserService is not initialized');
+        if (!this.#init) throw new ServiceUnavailableException('Timetable data is not ready');
         await this.renewData();
         return this.#data.teachers;
     }
 
     async getTodayBreakTimes(): Promise<Date[]> {
-        if (!this.#init) throw new Error('ParserService is not initialized');
+        if (!this.#init) throw new ServiceUnavailableException('Timetable data is not ready');
+        await this.renewData();
         const rawClassTimes = this.#data.classTimes;
         const result = [];
         for (let i = 0; i < rawClassTimes.length; i++) {
@@ -82,21 +91,25 @@ export class ParserService {
 
     async _getData() {
         const rawData = await this._getRawData();
+        const previous = this.#data;
         this.#data = await this._parseRawData(rawData);
-        return {
-            ...(await this._makeStudentTimeTable()),
-            ...(await this._makeTeacherTimeTable()),
-        } satisfies TimeTableModel;
+        try {
+            return {
+                ...(await this._makeStudentTimeTable()),
+                ...(await this._makeTeacherTimeTable()),
+            } satisfies TimeTableModel;
+        } catch (error) {
+            this.#data = previous;
+            throw error;
+        }
     }
 
     async _getRawData() {
-        const query = '36179_T?' + btoa(`73629_${process.env.SCHOOL_CODE}_0_`);
-        const data = await fetch(`http://comci.net:4082/${query}`)
-            .then((res) => res.text())
-            .then((data) => data.substr(0, data.lastIndexOf('}') + 1))
-            .then((data) => JSON.parse(data));
-
-        return data;
+        try {
+            return await fetchComciData(process.env.SCHOOL_CODE);
+        } catch {
+            throw new ServiceUnavailableException('Timetable data is temporarily unavailable');
+        }
     }
 
     async _parseRawData(rawData: RawDataModel) {
@@ -168,7 +181,7 @@ export class ParserService {
 
         for (let grade = 1; grade <= 3; grade++) {
             result.student[grade] = {};
-            for (let classroomNo = 1; classroomNo <= 9; classroomNo++) { // 학급 수 변동으로 인한 코드 수정_fixed by Paulee(이민상)
+            for (let classroomNo = 1; classroomNo <= this.#data.classCount[grade]; classroomNo++) {
                 if (result.student[grade][classroomNo] == null)
                     result.student[grade][classroomNo] = [];
                 result.student[grade][classroomNo] =
@@ -210,34 +223,43 @@ export class ParserService {
 
         for (let weekday = 1; weekday <= 5; weekday++) {
             results[weekday] = [];
-            const todayData = this.#data.nowTimeTable[grade][classroomNo][
+            const todayData = this.#data.nowTimeTable[grade]?.[classroomNo]?.[
                 weekday
             ] as Array<number>;
-            const originalData = this.#data.originalTimeTable[grade][
+            const originalData = this.#data.originalTimeTable[grade]?.[
                 classroomNo
-            ][weekday] as Array<number>;
-            for (let period = 1; period < todayData.length; period++) {
+            ]?.[weekday] as Array<number>;
+            const loopLength = (todayData && todayData.length > 1) ? todayData.length : (originalData ? originalData.length : 0);
+
+            for (let period = 1; period < loopLength; period++) {
                 results[weekday].push(null);
 
-                const periodData = todayData[period];
-                const originalPeriodData = originalData[period];
-                if (periodData > 100) {
-                    const isChanged = periodData !== originalPeriodData;
-                    const teacher = this._calcTeacherViaSTT(
-                        periodData,
-                        separator,
-                    );
-                    const subject = this._calcSubjectViaSTT(
-                        periodData,
-                        separator,
-                    );
+                let periodDataRaw = todayData ? todayData[period] : null;
+
+                if (periodDataRaw == null && originalData) {
+                    periodDataRaw = originalData[period];
+                }
+                if (!periodDataRaw) continue;
+
+                const periodDataList = Array.isArray(periodDataRaw) ? periodDataRaw : [periodDataRaw];
+                let firstData = periodDataList[0];
+
+                if (typeof firstData === 'string') {
+                    firstData = parseInt(firstData.replace(/[^0-9]/g, ''), 10);
+                }
+
+                if (firstData > 100) {
+                    const isChanged = !!(todayData && todayData[period]) &&
+                        JSON.stringify(todayData[period]) !== JSON.stringify(originalData ? originalData[period] : null);
+
+                    const teacher = this._calcTeacherViaSTT(firstData, separator);
+                    const subject = this._calcSubjectViaSTT(firstData, separator);
+
                     const result: ClassPeriod = {
                         grade: grade,
                         class: classroomNo,
                         weekday: weekday as WeekdayT,
-                        weekdayString: this.#weekdayString[
-                            weekday
-                        ] as WeekdayStringT,
+                        weekdayString: this.#weekdayString[weekday] as WeekdayStringT,
                         classTime: period,
                         subject: this.#data.subjects[subject] as string,
                         teacher: this.#data.teachers[teacher],
@@ -263,10 +285,27 @@ export class ParserService {
 
         for (let weekday = 1; weekday <= 5; weekday++) {
             results[weekday] = [];
-            for (let period = 1; period <= 7; period++) {
+            if (!teacherTimeTable || !teacherTimeTable[weekday]) {
+                for (let period = 1; period <= 7; period++) results[weekday].push(null);
+                continue;
+            }
+
+            const weekdayData = teacherTimeTable[weekday] as Array<any>;
+            const maxPeriod = weekdayData.length > 1 ? weekdayData.length : 8;
+
+            for (let period = 1; period < maxPeriod; period++) {
                 results[weekday].push(null);
 
-                const data = teacherTimeTable[weekday][period];
+                let dataRaw = weekdayData[period];
+                if (!dataRaw) continue;
+
+                const dataList = Array.isArray(dataRaw) ? dataRaw : [dataRaw];
+                let data = dataList[0];
+
+                if (typeof data === 'string') {
+                    data = parseInt(data.replace(/[^0-9]/g, ''), 10);
+                }
+
                 if (data > 100) {
                     const classroom = data % separator;
                     const grade = Math.floor(classroom / 100) as GradeT;
@@ -275,9 +314,7 @@ export class ParserService {
                     const result: ClassPeriod = {
                         teacher: teacher,
                         weekday: weekday as WeekdayT,
-                        weekdayString: this.#weekdayString[
-                            weekday
-                        ] as WeekdayStringT,
+                        weekdayString: this.#weekdayString[weekday] as WeekdayStringT,
                         grade,
                         class: classroomNo as ClassroomNoT,
                         subject: this.#data.subjects[subject] as string,

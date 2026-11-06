@@ -1,6 +1,6 @@
 declare namespace NodeJS {
     interface ProcessEnv {
-        SCHOOL_CODE: number;
+        SCHOOL_CODE: string;
         NEIS_API_KEY: string;
         MONGO_ID: string;
         MONGO_PASSWORD: string;

@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { ParserService } from '../parser/parser.service';
 import { isHoliday } from '@hyunbinseo/holidays-kr';
@@ -6,20 +6,58 @@ import { ClassPeriod } from '../models/timetable';
 import { FirebaseService } from '../firebase/firebase.service';
 
 @Injectable()
-export class TimetableService {
+export class TimetableService implements OnModuleDestroy {
     constructor(
         private readonly parserService: ParserService,
         private readonly firebase: FirebaseService,
     ) {
-        this.parserService.init().then(() => {
-            const now = new Date();
-            if (8 <= now.getHours() && now.getHours() <= 16) {
-                this._scheduleTimetable();
-            }
-        });
+        void this.#initializeAndSchedule();
     }
 
     #schedule: NodeJS.Timeout[] = [];
+    #retryTimer: NodeJS.Timeout | null = null;
+    #ready = false;
+    #destroyed = false;
+    #scheduling: Promise<void> | null = null;
+
+    async #initializeAndSchedule() {
+        if (this.#destroyed) return;
+        if (!this.#ready) {
+            try {
+                await this.parserService.init();
+                this.#ready = true;
+            } catch {
+                console.error('Timetable initialization failed; retrying in 30 seconds');
+                this.#scheduleRecovery();
+                return;
+            }
+        }
+        if (this.#destroyed) return;
+        const now = new Date();
+        if (8 <= now.getHours() && now.getHours() <= 16) {
+            try {
+                await this._scheduleTimetable();
+            } catch {
+                console.error('Timetable scheduling failed; retrying in 30 seconds');
+                this.#scheduleRecovery();
+            }
+        }
+    }
+
+    #scheduleRecovery() {
+        if (this.#destroyed || this.#retryTimer) return;
+        this.#retryTimer = setTimeout(() => {
+            this.#retryTimer = null;
+            void this.#initializeAndSchedule();
+        }, 30_000);
+    }
+
+    async onModuleDestroy() {
+        this.#destroyed = true;
+        if (this.#retryTimer) clearTimeout(this.#retryTimer);
+        this.#retryTimer = null;
+        await this.clearSchedule();
+    }
     #alertDisableDay = [
         '2024-9-4', // 9월 모의고사
     ];
@@ -38,6 +76,15 @@ export class TimetableService {
     // Monday to Friday at 8 AM
     @Cron(CronExpression.MONDAY_TO_FRIDAY_AT_8AM)
     async _scheduleTimetable() {
+        if (!this.#ready || this.#destroyed) return;
+        if (this.#scheduling) return this.#scheduling;
+        this.#scheduling = this.#createTimetableSchedule().finally(() => {
+            this.#scheduling = null;
+        });
+        return this.#scheduling;
+    }
+
+    async #createTimetableSchedule() {
         await this.clearSchedule();
 
         const now = new Date();
@@ -45,16 +92,22 @@ export class TimetableService {
         if (this.isAlertDisableDay(now)) return;
 
         const todayBreakTimes = await this.parserService.getTodayBreakTimes();
+        if (this.#destroyed) return;
 
         for (const breakTime of todayBreakTimes) {
             const delay = breakTime.getTime() - now.getTime();
             if (delay > 0) {
                 const fId = setTimeout(() => {
-                    this.parserService.renewData(true).then(() => {
-                        this._sendTimeTable(
-                            todayBreakTimes.indexOf(breakTime) + 1,
-                        );
-                    });
+                    void this.parserService.renewData(true)
+                        .then(() => {
+                            if (this.#destroyed) return;
+                            return this._sendTimeTable(
+                                todayBreakTimes.indexOf(breakTime) + 1,
+                            );
+                        })
+                        .catch(() => {
+                            console.error('Timetable notification refresh failed');
+                        });
                 }, delay);
                 console.log(
                     'scheduled:',
